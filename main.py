@@ -19,7 +19,7 @@ MAIN_CLICKHOUSE_USER = "default"
 MAIN_CLICKHOUSE_PASSWORD = "8aJlVz_A2L4On"
 DATABASE_NAME = "default"
 
-SERVERS_TABLE = "servers_for_symbols"
+SERVERS_TABLE = "servers_for_symbols2"
 CLICKHOUSE_TABLES = "CLICKHOUSE_TABLES"
 SERVER_ID_FILE = "server_id.txt"
 
@@ -355,4 +355,5 @@ if __name__ == "__main__":
     except ImportError:
         logging.error("The 'websocket-client' library is not installed. Please install it using: pip install websocket-client")
     except KeyboardInterrupt:
+
         logging.info("SIGINT received — exiting.")

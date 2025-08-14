@@ -1,5 +1,2 @@
-requests
-playwright
-beautifulsoup4
 clickhouse-driver
-lxml
+websocket-client

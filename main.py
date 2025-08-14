@@ -1,271 +1,358 @@
+# main.py (النسخة النهائية الكاملة)
+
 import os
 import random
 import string
 import time
+import logging
 import threading
-from clickhouse_driver import Client, errors
+import json
+import queue
+from datetime import datetime
+from clickhouse_driver import Client
 
-# ==============================
-# إعدادات الاتصال
-# ==============================
-CLICKHOUSE_HOST = "l5bxi83or6.eu-central-1.aws.clickhouse.cloud"
-CLICKHOUSE_USER = "default"
-CLICKHOUSE_PASSWORD = "8aJlVz_A2L4On"
-DATABASE_NAME = 'default'
-SERVERS_TABLE = 'servers_for_symbols2'
-SYMBOLS_TABLE = 'symbols'
+# =======================
+# إعدادات ثابتة
+# =======================
+MAIN_CLICKHOUSE_HOST = "l5bxi83or6.eu-central-1.aws.clickhouse.cloud"
+MAIN_CLICKHOUSE_USER = "default"
+MAIN_CLICKHOUSE_PASSWORD = "8aJlVz_A2L4On"
+DATABASE_NAME = "default"
 
-# ==============================
-# إعدادات التشغيل
-# ==============================
-TASK_DISCOVERY_INTERVAL = 10  # بالثواني
-HEARTBEAT_INTERVAL = 60       # بالثواني
-SERVER_IDLE_TIMEOUT = 120     # بالثواني (دقيقتان)
-# --- الإضافة الجديدة ---
-SERVER_DELETION_TIMEOUT = 60  # بالثواني (دقيقة واحدة) لحذف الصف بعد تحويله لـ 0
+SERVERS_TABLE = "servers_for_symbols"
+CLICKHOUSE_TABLES = "CLICKHOUSE_TABLES"
+SERVER_ID_FILE = "server_id.txt"
 
-TASK_COLUMNS = [
-    "task_trade",
-    "task_bookTicker",
-    "task_markPrice",
-    "task_kline_1m",
-    "task_kline_3m",
-    "task_kline_15m",
-    "task_kline_1h"
-]
+HEARTBEAT_INTERVAL = 60  # الانتظار 60 ثانية بين كل دورة في اللوب الرئيسي
+DB_WRITER_BATCH_SIZE = 100
+DB_WRITER_BATCH_TIMEOUT = 5
 
-# ==============================
-# متغيرات مشتركة
-# ==============================
-active_assignments = {}  # server_id -> (symbol, task_column)
-assignments_lock = threading.Lock()
-shutdown_event = threading.Event()
+# =======================
+# Logging
+# =======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# ==============================
-# دوال مساعدة
-# ==============================
-def get_clickhouse_client(current_client=None):
+# =======================
+# Helpers
+# =======================
+def rand_id(n=32):
+    """Generates a random ID."""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choices(chars, k=n))
+
+def sanitize_table_name(symbol: str, task: str) -> str:
+    """Creates a sanitized, valid table name from symbol and task."""
+    base = "".join(c if c.isalnum() else "_" for c in symbol).upper()
+    t = "".join(c if c.isalnum() else "_" for c in task).upper()
+    return f"{base}_{t}"
+
+def get_clickhouse_client(host, password, current_client=None):
+    """Establishes or validates a ClickHouse client connection."""
     if current_client:
         try:
             current_client.execute("SELECT 1")
             return current_client
         except Exception:
-            print("[اتصال] إعادة الاتصال...")
-    return Client(
-        host=CLICKHOUSE_HOST,
-        user=CLICKHOUSE_USER,
-        password=CLICKHOUSE_PASSWORD,
-        database=DATABASE_NAME,
-        secure=True
+            try:
+                current_client.disconnect()
+            except Exception: pass
+    return Client(host=host, user=MAIN_CLICKHOUSE_USER, password=password, database=DATABASE_NAME, secure=True)
+
+def build_symbol_search_condition(symbol: str, n: int = 50) -> str:
+    """
+    Creates a WHERE clause to search for a specific symbol in columns symbol1 to symbolN.
+    """
+    conditions = [f'"{f"symbol{i}"}" = \'{symbol}\'' for i in range(1, n + 1)]
+    return " OR ".join(conditions)
+
+# ==========================================================
+# تعريفات مهام الـ WebSocket (مع فصل داخلي للأسواق)
+# ==========================================================
+def parse_trade_message(data, symbol):
+    return (
+        data.get('e', ''), datetime.fromtimestamp(data['E'] / 1000), data.get('s', symbol),
+        int(data.get('t', 0)), float(data.get('p', 0.0)), float(data.get('q', 0.0)),
+        int(data.get('b', 0)), int(data.get('a', 0)), datetime.fromtimestamp(data['T'] / 1000),
+        1 if data.get('m', False) else 0, 1 if data.get('M', False) else 0
     )
 
-def verify_or_create_tables(client):
-    create_servers_sql = f"""
-    CREATE TABLE IF NOT EXISTS {DATABASE_NAME}.{SERVERS_TABLE} (
-        server_id String,
-        symbol Nullable(String),
-        task_web_socket Nullable(String),
-        statu String DEFAULT 'pending',
-        last_update DateTime DEFAULT now()
-    ) ENGINE = MergeTree() ORDER BY server_id
-    """
-    client.execute(create_servers_sql)
-    print("[جدول] تم التأكد من وجود جدول السيرفرات.")
+def parse_bookticker_message(data, symbol):
+    return (
+        datetime.now(), int(data.get('u', 0)), data.get('s', symbol),
+        float(data.get('b', 0.0)), float(data.get('B', 0.0)),
+        float(data.get('a', 0.0)), float(data.get('A', 0.0))
+    )
 
-    exists_symbols = client.execute(f"EXISTS TABLE {DATABASE_NAME}.{SYMBOLS_TABLE}")[0][0]
-    if exists_symbols == 0:
-        raise RuntimeError(f"❌ جدول {SYMBOLS_TABLE} غير موجود! يجب إنشاؤه أولاً.")
+def parse_markprice_message(data, symbol):
+    return (
+        data.get('e', ''), datetime.fromtimestamp(data['E'] / 1000), data.get('s', symbol),
+        float(data.get('p', 0.0)), float(data.get('i', 0.0)), float(data.get('P', 0.0)),
+        float(data.get('r', 0.0)), datetime.fromtimestamp(data['T'] / 1000)
+    )
 
-# ==============================
-# Thread لتحديث الـ last_update
-# ==============================
-def heartbeat_worker(server_id, symbol, task_column):
-    client = None
-    while not shutdown_event.is_set():
-        try:
-            client = get_clickhouse_client(client)
+def parse_kline_message(data, symbol):
+    k = data.get('k', {})
+    return (
+        data.get('e', ''), datetime.fromtimestamp(data['E'] / 1000), data.get('s', symbol),
+        datetime.fromtimestamp(k.get('t', 0) / 1000), datetime.fromtimestamp(k.get('T', 0) / 1000),
+        k.get('i', ''), int(k.get('f', 0)), int(k.get('L', 0)), float(k.get('o', 0.0)),
+        float(k.get('c', 0.0)), float(k.get('h', 0.0)), float(k.get('l', 0.0)),
+        float(k.get('v', 0.0)), int(k.get('n', 0)), k.get('x', False), float(k.get('q', 0.0)),
+        float(k.get('V', 0.0)), float(k.get('Q', 0.0))
+    )
 
-            check = client.execute(
-                f"""
-                SELECT count() FROM {SERVERS_TABLE}
-                WHERE server_id = %(id)s
-                AND statu = '1'
-                AND symbol = %(symbol)s
-                AND task_web_socket = %(task)s
-                """,
-                {"id": server_id, "symbol": symbol, "task": task_column}
-            )[0][0]
+STREAM_BASE_URLS = {
+    "spot": "wss://stream.binance.com:9443/ws",
+    "futures": "wss://fstream.binance.com/ws",
+}
 
-            if check == 0:
-                print(f"[Heartbeat] إيقاف التحديث لـ {server_id} لأنه لم يعد مسؤولاً عن {symbol} ({task_column})")
+WEBSOCKET_HANDLERS = {
+    "task_trade": {
+        "market_type": "spot", "stream_name": lambda symbol: f"{symbol.lower()}@trade",
+        "schema": """CREATE TABLE IF NOT EXISTS {db}.{table} (e String, E DateTime, s String, t UInt64, p Float64, q Float64, b UInt64, a UInt64, T DateTime, m UInt8, M UInt8) ENGINE = MergeTree() ORDER BY T""",
+        "parser": parse_trade_message
+    },
+    "task_bookTicker": {
+        "market_type": "spot", "stream_name": lambda symbol: f"{symbol.lower()}@bookTicker",
+        "schema": """CREATE TABLE IF NOT EXISTS {db}.{table} (received_time DateTime, u UInt64, s String, b Float64, B Float64, a Float64, A Float64) ENGINE = MergeTree() ORDER BY received_time""",
+        "parser": parse_bookticker_message
+    },
+    "task_markPrice": {
+        "market_type": "futures", "stream_name": lambda symbol: f"{symbol.lower()}@markPrice@1s",
+        "schema": """CREATE TABLE IF NOT EXISTS {db}.{table} (e String, E DateTime, s String, p Float64, i Float64, P Float64, r Float64, T DateTime) ENGINE = MergeTree() ORDER BY E""",
+        "parser": parse_markprice_message
+    },
+    **{f"task_kline_{interval}": {
+        "market_type": "spot", "stream_name": lambda symbol, i=interval: f"{symbol.lower()}@kline_{i}",
+        "schema": """CREATE TABLE IF NOT EXISTS {db}.{table} (e String, E DateTime, s String, t DateTime, T DateTime, i String, f UInt64, L UInt64, o Float64, c Float64, h Float64, l Float64, v Float64, n UInt64, x Bool, q Float64, V Float64, Q Float64) ENGINE = MergeTree() ORDER BY t""",
+        "parser": parse_kline_message
+    } for interval in ["1m", "3m", "15m", "1h"]}
+}
+
+# ===============================================
+# Generic Websocket Worker Engine
+# ===============================================
+active_ws = {}
+active_ws_lock = threading.Lock()
+
+def generic_websocket_worker(main_host, main_password, sec_host, sec_password, server_id, symbol, task_col, handler_config):
+    table_name = sanitize_table_name(symbol, task_col)
+    log_prefix = f"[{task_col.upper()}-{server_id[:8]}]"
+
+    main_client, sec_client = None, None
+    try:
+        main_client = get_clickhouse_client(main_host, main_password)
+        sec_client = get_clickhouse_client(sec_host, sec_password)
+    except Exception as e:
+        logging.error(f"{log_prefix} Failed to create clients: {e}")
+        return
+
+    try:
+        create_q = handler_config["schema"].format(db=DATABASE_NAME, table=table_name)
+        sec_client.execute(create_q)
+        logging.info(f"{log_prefix} Verified/created secondary table: {table_name}")
+    except Exception as e:
+        logging.error(f"{log_prefix} Error creating table {table_name}: {e}")
+        return
+
+    stop_flag = threading.Event()
+    data_queue = queue.Queue()
+
+    def db_writer_loop():
+        nonlocal sec_client
+        batch = []
+        last_insert_time = time.time()
+        parser = handler_config["parser"]
+
+        while not stop_flag.is_set() or not data_queue.empty():
+            try:
+                message_str = data_queue.get(timeout=1)
+                data = json.loads(message_str)
+                row_tuple = parser(data, symbol)
+                batch.append(row_tuple)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logging.error(f"{log_prefix} Error processing message from queue: {e}")
+
+            if batch and (len(batch) >= DB_WRITER_BATCH_SIZE or (time.time() - last_insert_time > DB_WRITER_BATCH_TIMEOUT)):
+                try:
+                    sec_client.execute(f"INSERT INTO {DATABASE_NAME}.{table_name} VALUES", batch)
+                    logging.debug(f"{log_prefix} Inserted {len(batch)} rows into {table_name}.")
+                    batch = []
+                    last_insert_time = time.time()
+                except Exception as e:
+                    logging.error(f"{log_prefix} Batch insert failed: {e}. Reconnecting...")
+                    sec_client = get_clickhouse_client(sec_host, sec_password, sec_client)
+                    time.sleep(5)
+        logging.info(f"{log_prefix} DB writer thread for {symbol} has stopped.")
+
+    def run_ws_loop():
+        db_writer_thread = threading.Thread(target=db_writer_loop, name=f"db-{server_id[:8]}-{symbol}", daemon=True)
+        db_writer_thread.start()
+
+        market_type = handler_config["market_type"]
+        base_url = STREAM_BASE_URLS[market_type]
+        stream_name = handler_config["stream_name"](symbol)
+        ws_url = f"{base_url}/{stream_name}"
+
+        def check_assignment_still_valid():
+            try:
+                row = main_client.execute(
+                    f"SELECT symbol, task_web_socket FROM {SERVERS_TABLE} WHERE server_id = %(id)s", {'id': server_id})
+                return row and str(row[0][0]) == str(symbol) and str(row[0][1]) == str(task_col)
+            except Exception as e:
+                logging.error(f"{log_prefix} Error checking assignment: {e}")
+                return False
+
+        def on_message(ws, message): data_queue.put(message)
+        def on_error(ws, error): logging.error(f"{log_prefix} WebSocket error: {error}")
+        def on_close(ws, code, reason): logging.warning(f"{log_prefix} WebSocket closed: code={code}, reason={reason}")
+        def on_open(ws): logging.info(f"{log_prefix} Connected to {ws_url}")
+        
+        while not stop_flag.is_set():
+            if not check_assignment_still_valid():
+                logging.info(f"{log_prefix} Assignment no longer valid. Closing WS for {symbol}")
                 break
+            
+            try:
+                ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
+                ws.run_forever()
+            except Exception as e:
+                logging.error(f"{log_prefix} Exception in run_forever: {e}")
 
-            client.execute(
-                f"""
-                ALTER TABLE {SYMBOLS_TABLE}
-                UPDATE {task_column}_last_update = now()
-                WHERE symbol = %(symbol)s
-                """,
-                {"symbol": symbol}
-            )
-            print(f"[Heartbeat] {server_id} ← تحديث {symbol} ({task_column})")
+            if not check_assignment_still_valid(): break
+            logging.info(f"{log_prefix} Reconnecting in 5 seconds...")
+            time.sleep(5)
 
-        except Exception as e:
-            print(f"[Heartbeat] خطأ في {server_id}: {e}")
-            client = None
-
-        shutdown_event.wait(HEARTBEAT_INTERVAL)
-
-
-# ==============================
-# Thread لمراقبة السيرفرات الخاملة
-# ==============================
-def server_status_watcher():
-    client = None
-    while not shutdown_event.is_set():
+        stop_flag.set()
+        db_writer_thread.join(timeout=10)
         try:
-            client = get_clickhouse_client(client)
+            sec_client.disconnect(); main_client.disconnect()
+        except: pass
+        with active_ws_lock: active_ws.pop(server_id, None)
+        logging.info(f"{log_prefix} WS worker for {symbol} has finished.")
 
-            # --- المرحلة الأولى (الكود الأصلي): تحويل السيرفرات الخاملة (1) إلى (0) ---
-            # هذا يمنع تحويل السيرفرات الجديدة التي لم تبدأ عملها بعد إلى '0'
-            update_query = f"""
-                ALTER TABLE {SERVERS_TABLE}
-                UPDATE statu = '0', symbol = NULL, task_web_socket = NULL
-                WHERE statu = '1' AND now() - last_update > toIntervalSecond({SERVER_IDLE_TIMEOUT})
-            """
-            client.execute(update_query)
-            print("[Watcher] تم التحقق من السيرفرات الخاملة (statu='1') لتحويلها إلى '0'.")
+    t = threading.Thread(target=run_ws_loop, name=f"ws-{server_id[:8]}-{symbol}", daemon=True)
+    t.start()
+    return t
 
-            # --- المرحلة الثانية (الإضافة الجديدة): حذف الصفوف التي حالتها (0) لأكثر من دقيقة ---
-            # المنطق: إذا كان الفارق الزمني منذ آخر تحديث (قبل أن يصبح خاملًا) أكبر من
-            # مهلة الخمول + مهلة الحذف، فإنه يجب حذفه.
-            delete_timeout = SERVER_IDLE_TIMEOUT + SERVER_DELETION_TIMEOUT
-            delete_query = f"""
-                ALTER TABLE {SERVERS_TABLE}
-                DELETE WHERE statu = '0' AND now() - last_update > toIntervalSecond({delete_timeout})
-            """
-            client.execute(delete_query)
-            print(f"[Watcher] تم التحقق من السيرفرات القديمة (statu='0') التي تجاوزت {SERVER_DELETION_TIMEOUT} ثانية لحذفها.")
+def start_websocket_worker(main_host, main_pass, sec_host, sec_pass, server_id, symbol, task_col):
+    """Dispatcher function to start the correct websocket worker."""
+    if not task_col:
+        return None
 
+    handler_config = WEBSOCKET_HANDLERS.get(task_col)
+    if not handler_config:
+        logging.warning(f"[Main] No handler defined for task: '{task_col}'.")
+        return None
 
-        except Exception as e:
-            print(f"[Watcher] خطأ: {e}")
-            client = None
+    logging.info(f"[Main] Starting worker for {symbol} with task {task_col}")
+    return generic_websocket_worker(main_host, main_pass, sec_host, sec_pass, server_id, symbol, task_col, handler_config)
 
-        # يعمل المراقب كل دقيقة
-        shutdown_event.wait(60)
+# =======================
+# Main loop
+# =======================
+def find_secondary_credentials(main_client, symbol_to_find):
+    """
+    Searches for the specified symbol in CLICKHOUSE_TABLES.
+    If found, returns the connection credentials for the row containing it.
+    """
+    if not symbol_to_find:
+        logging.warning("[CredentialFinder] No symbol provided to search for.")
+        return None, None
+        
+    logging.info(f"[CredentialFinder] Searching for secondary DB assigned to symbol: '{symbol_to_find}'...")
+    
+    search_condition = build_symbol_search_condition(symbol_to_find)
+    
+    query = f"""
+    SELECT CLICKHOUSE_HOST, CLICKHOUSE_PASSWORD 
+    FROM {DATABASE_NAME}.{CLICKHOUSE_TABLES}
+    WHERE {search_condition}
+    LIMIT 1
+    """
+    
+    try:
+        rows = main_client.execute(query)
+        if rows:
+            host, password = rows[0]
+            logging.info(f"[CredentialFinder] ✅ Found symbol '{symbol_to_find}' on host: {host.split('.')[0]}")
+            return host, password
+        else:
+            logging.warning(f"[CredentialFinder] ⏳ Symbol '{symbol_to_find}' not found in any DB yet. Will retry.")
+            return None, None
+            
+    except Exception as e:
+        logging.error(f"[CredentialFinder] Error finding credentials for '{symbol_to_find}': {e}")
+        return None, None
 
+def ensure_servers_table(main_client):
+    q = f"""CREATE TABLE IF NOT EXISTS {DATABASE_NAME}.{SERVERS_TABLE} (
+        server_id String, symbol Nullable(String), task_web_socket Nullable(String),
+        statu String DEFAULT 'pending', last_update DateTime DEFAULT now()
+    ) ENGINE = MergeTree() ORDER BY server_id"""
+    main_client.execute(q)
 
-# ==============================
-# توزيع المهام
-# ==============================
-def task_discovery_worker():
-    client = None
-    round_num = 0
-    while not shutdown_event.is_set():
-        round_num += 1
-        print(f"\n===== جولة توزيع رقم {round_num} =====")
+def main_loop():
+    server_id = None
+    if os.path.exists(SERVER_ID_FILE):
+        with open(SERVER_ID_FILE, 'r') as f:
+            server_id = f.read().strip()
+    else:
+        server_id = rand_id(32)
+        with open(SERVER_ID_FILE, 'w') as f: f.write(server_id)
+        logging.info(f"[Main] Created and saved new server_id: {server_id}")
+
+    main_client = None
+    while True:
         try:
-            client = get_clickhouse_client(client)
+            main_client = get_clickhouse_client(MAIN_CLICKHOUSE_HOST, MAIN_CLICKHOUSE_PASSWORD, main_client)
+            ensure_servers_table(main_client)
 
-            servers_query = f"""
-                SELECT server_id FROM {SERVERS_TABLE}
-                WHERE statu = '1' AND (symbol IS NULL OR task_web_socket IS NULL)
-            """
-            available_servers = [s[0] for s in client.execute(servers_query)]
-            print(f"[جولة {round_num}] عدد السيرفرات المؤهلة: {len(available_servers)}")
+            if main_client.execute(f"SELECT count() FROM {SERVERS_TABLE} WHERE server_id=%(id)s", {'id': server_id})[0][0] == 0:
+                main_client.execute(f"INSERT INTO {SERVERS_TABLE} (server_id, statu) VALUES", [(server_id, '0')])
+                logging.info(f"[Main] Registered server: {server_id}")
 
-            if not available_servers:
-                print(f"[جولة {round_num}] لا توجد سيرفرات متاحة. انتظار...")
-                shutdown_event.wait(TASK_DISCOVERY_INTERVAL)
-                continue
+            rows = main_client.execute(f"SELECT symbol, task_web_socket FROM {SERVERS_TABLE} WHERE server_id = %(id)s", {'id': server_id})
+            symbol, task_col = (rows[0] if rows else (None, None))
+            logging.info(f"[Main] Read values: symbol='{symbol}', task='{task_col}'")
 
-            symbols_query = f"""
-                SELECT symbol, {', '.join(TASK_COLUMNS)}
-                FROM {SYMBOLS_TABLE}
-                ORDER BY hot_rank ASC
-            """
-            all_symbols_with_tasks = client.execute(symbols_query)
-
-            assigned_symbols_this_round = set()
-
-            for row in all_symbols_with_tasks:
-                if not available_servers:
-                    print(f"[جولة {round_num}] نفدت السيرفرات المتاحة. إنهاء الجولة.")
-                    break
-
-                symbol = row[0]
-                if symbol in assigned_symbols_this_round:
-                    continue
-
-                tasks_status = row[1:]
-                for idx, val in enumerate(tasks_status):
-                    if val == 0:
-                        server_id = available_servers.pop(0)
-                        task_column = TASK_COLUMNS[idx]
-
-                        print(f"[جولة {round_num}] {server_id} ← تخصيص {symbol} ({task_column})")
-
-                        client.execute(
-                            f"""
-                            ALTER TABLE {SYMBOLS_TABLE}
-                            UPDATE {task_column} = 1, {task_column}_last_update = now()
-                            WHERE symbol = %(symbol)s AND {task_column} = 0
-                            """,
-                            {"symbol": symbol}
-                        )
-
-                        client.execute(
-                            f"""
-                            ALTER TABLE {SERVERS_TABLE}
-                            UPDATE symbol = %(symbol)s, task_web_socket = %(task)s
-                            WHERE server_id = %(id)s
-                            """,
-                            {"symbol": symbol, "task": task_column, "id": server_id}
-                        )
-
-                        assigned_symbols_this_round.add(symbol)
-                        with assignments_lock:
-                            active_assignments[server_id] = (symbol, task_column)
-                        threading.Thread(
-                            target=heartbeat_worker,
-                            args=(server_id, symbol, task_column),
-                            daemon=True
-                        ).start()
-
-                        break
-
-            print(f"[جولة {round_num}] انتهاء الجولة. انتظار {TASK_DISCOVERY_INTERVAL} ثانية...")
+            main_client.execute(f"ALTER TABLE {SERVERS_TABLE} UPDATE statu = '1', last_update = now() WHERE server_id = %(id)s", {'id': server_id})
+            
+            if symbol and task_col:
+                with active_ws_lock:
+                    if server_id not in active_ws:
+                        sec_host, sec_pass = find_secondary_credentials(main_client, symbol)
+                        
+                        if sec_host and sec_pass:
+                            logging.info(f"[Main] Credentials found. Starting worker...")
+                            thr = start_websocket_worker(
+                                MAIN_CLICKHOUSE_HOST, MAIN_CLICKHOUSE_PASSWORD,
+                                sec_host, sec_pass, server_id, symbol, task_col
+                            )
+                            if thr: active_ws[server_id] = thr
+                        else:
+                            logging.warning(f"[Main] No dedicated DB found for '{symbol}' yet. Waiting for next cycle.")
 
         except Exception as e:
-            print(f"[توزيع المهام] خطأ: {e}")
-            client = None
+            logging.error(f"[Main] Main loop exception: {e}", exc_info=True)
+            if main_client:
+                try: main_client.disconnect()
+                except: pass
+            main_client = None
 
-        shutdown_event.wait(TASK_DISCOVERY_INTERVAL)
+        time.sleep(HEARTBEAT_INTERVAL)
 
-# ==============================
-# تشغيل البرنامج
-# ==============================
 if __name__ == "__main__":
     try:
-        main_client = get_clickhouse_client()
-        verify_or_create_tables(main_client)
-        main_client.disconnect()
-
-        print("\n--- بدء خدمات توزيع المهام والمراقبة ---")
-
-        task_distributor_thread = threading.Thread(target=task_discovery_worker, daemon=True)
-        task_distributor_thread.start()
-
-        watcher_thread = threading.Thread(target=server_status_watcher, daemon=True)
-        watcher_thread.start()
-
-        while True:
-            time.sleep(1)
-
+        import websocket
+        main_loop()
+    except ImportError:
+        logging.error("The 'websocket-client' library is not installed. Please install it using: pip install websocket-client")
     except KeyboardInterrupt:
-        print("\n[إيقاف] تم استقبال إشارة الإنهاء... جاري إيقاف الـ threads.")
-        shutdown_event.set()
-    except Exception as e:
-        print(f"[خطأ رئيسي] حدث خطأ فادح: {e}")
-        shutdown_event.set()
+        logging.info("SIGINT received — exiting.")
